@@ -37,6 +37,7 @@ import hashlib
 import threading
 import tempfile
 import shutil
+import traceback
 import urllib.request
 import urllib.error
 from datetime import date, timedelta
@@ -140,8 +141,18 @@ def delete_tokens(user_id):
     sb("DELETE", "garmin_tokens?user_id=eq.%s" % user_id)
 
 
-# ── Garmin token (de)serialization — via garth's on-disk token store ──────────
+# ── Garmin token (de)serialization ────────────────────────────────────────────
+# Preferred: garth's documented single-string blob (dumps()/login(blob) — a
+# string longer than 512 chars routes to garth.loads()). Fallback: the on-disk
+# token-file pair. Restore understands both, plus legacy rows from the first
+# build (a bare files dict).
 def serialize_tokens(client):
+    try:
+        blob = client.garth.dumps()
+        if isinstance(blob, str) and len(blob) > 512:
+            return json.dumps({"format": "dumps", "blob": blob})
+    except Exception:
+        pass  # fall through to the file-based store
     d = tempfile.mkdtemp(prefix="gc_")
     try:
         client.garth.dump(d)  # writes oauth1_token.json + oauth2_token.json
@@ -149,19 +160,24 @@ def serialize_tokens(client):
         for fn in os.listdir(d):
             with open(os.path.join(d, fn), "r") as fh:
                 files[fn] = fh.read()
-        return json.dumps(files)
+        return json.dumps({"format": "files", "files": files})
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
 
 def client_from_tokens(token_str):
-    files = json.loads(token_str)
+    data = json.loads(token_str)
+    if not isinstance(data, dict) or "format" not in data:
+        data = {"format": "files", "files": data}  # legacy shape
+    client = Garmin()
+    if data["format"] == "dumps":
+        client.login(data["blob"])  # >512 chars → garth.loads()
+        return client
     d = tempfile.mkdtemp(prefix="gc_")
     try:
-        for fn, content in files.items():
+        for fn, content in (data.get("files") or {}).items():
             with open(os.path.join(d, fn), "w") as fh:
                 fh.write(content)
-        client = Garmin()
         client.login(d)  # restore from token store (no password needed)
         return client
     finally:
@@ -184,7 +200,7 @@ class PendingLogin:
         self.created = time.time()
         self._thread = threading.Thread(target=self._run, args=(email, password), daemon=True)
 
-    def _prompt_mfa(self):
+    def _prompt_mfa(self, *_args, **_kwargs):
         self.mfa_invoked.set()
         if not self.code_ready.wait(timeout=MFA_TTL_SECONDS - 20):
             raise TimeoutError("MFA code was not entered in time")
@@ -194,9 +210,18 @@ class PendingLogin:
         try:
             client = Garmin(email=email, password=password, prompt_mfa=self._prompt_mfa)
             client.login()
-            self.tokens = serialize_tokens(client)
         except Exception as e:  # noqa: BLE001 — surface any login error to the caller
-            self.error = str(e)
+            self.error = "login: %s: %s" % (type(e).__name__, e)
+            print("[garmin] login failed: %s" % e, flush=True)
+            print(traceback.format_exc(), flush=True)
+            self.done.set()
+            return
+        try:
+            self.tokens = serialize_tokens(client)
+        except Exception as e:  # login SUCCEEDED — do not blame the MFA code
+            self.error = "token-save: %s: %s" % (type(e).__name__, e)
+            print("[garmin] token serialization failed: %s" % e, flush=True)
+            print(traceback.format_exc(), flush=True)
         finally:
             self.done.set()
 
@@ -453,7 +478,7 @@ def mfa():
 
     pending.code = code
     pending.code_ready.set()
-    pending.done.wait(timeout=30)
+    pending.done.wait(timeout=45)
 
     with _pending_lock:
         _pending.pop(uid, None)
@@ -463,7 +488,15 @@ def mfa():
     if pending.tokens:
         save_tokens(uid, pending.tokens)
         return jsonify({"status": "connected"})
-    return jsonify({"error": "That code was not accepted — please reconnect and try again."}), 401
+    # Surface the REAL reason (never contains credentials) so failures are
+    # debuggable from the phone; full traceback is in the service logs.
+    detail = str(pending.error or "no detail")[:220]
+    print("[garmin] mfa flow failed for user %s: %s" % (uid, detail), flush=True)
+    if detail.startswith("token-save:"):
+        msg = "Garmin sign-in worked, but saving the connection failed — please report this: " + detail
+    else:
+        msg = "Garmin rejected the code or the sign-in — reconnect and use the newest code. (" + detail + ")"
+    return jsonify({"error": msg}), 401
 
 
 @app.route("/api/garmin/sync", methods=["POST"])
@@ -513,7 +546,8 @@ def _login_error_message(msg):
     m = (msg or "").lower()
     if "lock" in m:
         return "Garmin has temporarily locked sign-ins for this account — wait a while and try again."
-    return "Garmin sign-in failed — check the email and password."
+    # Include the real reason (never contains credentials) for debuggability.
+    return "Garmin sign-in failed — check the email and password. (" + str(msg or "no detail")[:220] + ")"
 
 
 def _login_error_code(msg):
