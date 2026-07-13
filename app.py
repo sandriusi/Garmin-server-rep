@@ -146,16 +146,26 @@ def delete_tokens(user_id):
 # string longer than 512 chars routes to garth.loads()). Fallback: the on-disk
 # token-file pair. Restore understands both, plus legacy rows from the first
 # build (a bare files dict).
+def _auth_client(client):
+    # The internal auth/token client is `.garth` in older garminconnect
+    # releases and `.client` in current ones — support both.
+    auth = getattr(client, "garth", None) or getattr(client, "client", None)
+    if auth is None:
+        raise RuntimeError("garminconnect exposed no auth client (.garth/.client)")
+    return auth
+
+
 def serialize_tokens(client):
+    auth = _auth_client(client)
     try:
-        blob = client.garth.dumps()
+        blob = auth.dumps()
         if isinstance(blob, str) and len(blob) > 512:
             return json.dumps({"format": "dumps", "blob": blob})
     except Exception:
         pass  # fall through to the file-based store
     d = tempfile.mkdtemp(prefix="gc_")
     try:
-        client.garth.dump(d)  # writes oauth1_token.json + oauth2_token.json
+        auth.dump(d)  # writes oauth1_token.json + oauth2_token.json
         files = {}
         for fn in os.listdir(d):
             with open(os.path.join(d, fn), "r") as fh:
