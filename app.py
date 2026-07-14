@@ -49,6 +49,7 @@ from flask import Flask, request, jsonify
 from garminconnect import Garmin
 
 # ── Config ────────────────────────────────────────────────────────────────────
+SERVICE_VERSION = "2026-07-13c"  # shown at /healthz — bump when app.py changes
 SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "").rstrip("/")
 SERVICE_ROLE = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or ""
 GARMIN_ENC_KEY = os.environ.get("GARMIN_ENC_KEY") or ""
@@ -282,6 +283,9 @@ def pull_all(client):
                 "distance": a.get("distance") or 0,  # meters
                 "elevationGain": a.get("elevationGain"),
                 "trainingLoad": a.get("activityTrainingLoad"),
+                "aerobicTrainingEffect": a.get("aerobicTrainingEffect"),
+                "anaerobicTrainingEffect": a.get("anaerobicTrainingEffect"),
+                "trainingEffectLabel": a.get("trainingEffectLabel"),
                 "source": "garmin",
             })
         out["activities"] = [a for a in out["activities"] if a["date"]]
@@ -384,6 +388,112 @@ def pull_all(client):
     return out
 
 
+# ── Per-activity detail (HR zones, splits, HR trace, training effect) ─────────
+# Lazy-fetched by the app the first time an activity's detail view opens, then
+# cached client-side forever (a finished activity's data never changes).
+ACTIVITY_TRACE_POINTS = 120  # Garmin downsamples server-side via maxChartSize
+
+
+def _num_activity_id(raw):
+    """Accept 'garmin-12345' or '12345'; return the numeric id string or None."""
+    s = str(raw or "").strip()
+    if s.startswith("garmin-"):
+        s = s[len("garmin-"):]
+    return s if s.isdigit() else None
+
+
+def pull_activity_detail(client, aid):
+    warnings = []
+    out = {"id": "garmin-" + aid, "zones": None, "splits": None, "hrTrace": None,
+           "trainingEffect": None,
+           "syncedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
+    # HR time in zones — NOTE: returns a JSON ARRAY despite the lib's dict hint
+    try:
+        zones = client.get_activity_hr_in_timezones(aid)
+        norm = []
+        for z in (zones or []):
+            if not isinstance(z, dict) or z.get("secsInZone") is None:
+                continue
+            norm.append({"zone": z.get("zoneNumber"),
+                         "secs": int(round(float(z["secsInZone"]))),
+                         "lowBpm": z.get("zoneLowBoundary")})
+        norm.sort(key=lambda z: z.get("zone") or 0)
+        if norm:
+            out["zones"] = norm
+    except Exception as e:
+        warnings.append("zones: " + str(e))
+
+    # Splits / laps
+    try:
+        sp = client.get_activity_splits(aid) or {}
+        laps = []
+        for i, lap in enumerate(sp.get("lapDTOs") or []):
+            if not isinstance(lap, dict):
+                continue
+            laps.append({
+                "index": lap.get("lapIndex") or (i + 1),
+                "distanceM": lap.get("distance"),
+                "durationS": lap.get("duration"),
+                "avgHeartRate": lap.get("averageHR"),
+                "maxHeartRate": lap.get("maxHR"),
+                "avgSpeed": lap.get("averageSpeed"),  # m/s
+                "elevationGain": lap.get("elevationGain"),
+                "calories": lap.get("calories"),
+            })
+        if laps:
+            out["splits"] = laps
+    except Exception as e:
+        warnings.append("splits: " + str(e))
+
+    # HR trace, downsampled by Garmin to <= ACTIVITY_TRACE_POINTS samples.
+    # metricDescriptors order varies per device — never hardcode indexes.
+    try:
+        det = client.get_activity_details(aid, maxchart=ACTIVITY_TRACE_POINTS, maxpoly=0) or {}
+        idx = {}
+        for d in (det.get("metricDescriptors") or []):
+            if isinstance(d, dict) and d.get("key") and d.get("metricsIndex") is not None:
+                idx[d["key"]] = d["metricsIndex"]
+        hi, ti, di = idx.get("directHeartRate"), idx.get("directTimestamp"), idx.get("sumDuration")
+        trace = []
+        t0 = None
+        for row in (det.get("activityDetailMetrics") or []):
+            m = (row or {}).get("metrics") or []
+            hr = m[hi] if (hi is not None and hi < len(m)) else None
+            if hr is None:
+                continue  # sensor dropouts leave nulls
+            sec = None
+            if di is not None and di < len(m) and m[di] is not None:
+                sec = float(m[di])
+            elif ti is not None and ti < len(m) and m[ti] is not None:
+                if t0 is None:
+                    t0 = float(m[ti])
+                sec = (float(m[ti]) - t0) / 1000.0  # GMT epoch ms → offset s
+            trace.append([int(round(sec)) if sec is not None else None,
+                          int(round(float(hr)))])
+        if trace:
+            out["hrTrace"] = trace
+    except Exception as e:
+        warnings.append("details: " + str(e))
+
+    # Training effect from the full summary (sync already carries it for new
+    # pulls, but older cached activities and dedup-merged records rely on this)
+    try:
+        summ = (client.get_activity(aid) or {}).get("summaryDTO") or {}
+        if summ.get("aerobicTrainingEffect") is not None or summ.get("anaerobicTrainingEffect") is not None:
+            out["trainingEffect"] = {
+                "aerobic": summ.get("aerobicTrainingEffect"),
+                "anaerobic": summ.get("anaerobicTrainingEffect"),
+                "label": summ.get("trainingEffectLabel"),
+            }
+    except Exception as e:
+        warnings.append("summary: " + str(e))
+
+    if warnings:
+        out["warnings"] = warnings
+    return out
+
+
 # ── HTTP ──────────────────────────────────────────────────────────────────────
 @app.after_request
 def cors(resp):
@@ -396,7 +506,7 @@ def cors(resp):
 @app.route("/healthz", methods=["GET"])
 @app.route("/", methods=["GET"])
 def healthz():
-    return jsonify({"ok": True, "service": "fitmind-garmin", "configured": configured()})
+    return jsonify({"ok": True, "service": "fitmind-garmin", "version": SERVICE_VERSION, "configured": configured()})
 
 
 def _body():
@@ -535,6 +645,57 @@ def sync():
         return jsonify(data)
     except Exception as e:
         return jsonify({"error": "Garmin sync failed: " + str(e)}), 502
+
+
+@app.route("/api/garmin/activity", methods=["POST"])
+def activity_detail():
+    ctx, err = _auth_or_401()
+    if err:
+        return err
+    uid, body = ctx
+    aid = _num_activity_id(body.get("activity_id"))
+    if not aid:
+        return jsonify({"error": "A numeric Garmin activity id is required."}), 400
+    try:
+        row = load_tokens(uid)
+    except Exception as e:
+        return jsonify({"error": "Could not read the Garmin connection: " + str(e)}), 502
+    if not row:
+        return jsonify({"error": "not_connected"}), 400
+    try:
+        client = client_from_tokens(row["tokens"])
+    except Exception as e:
+        msg = str(e).lower()
+        if any(w in msg for w in ("401", "403", "expired", "unauthor", "forbidden", "login")):
+            return jsonify({"error": "garmin_reauth",
+                            "message": "The Garmin connection has expired — reconnect it in your Profile."}), 401
+        return jsonify({"error": "Garmin detail failed: " + str(e)}), 502
+    try:
+        data = pull_activity_detail(client, aid)
+        try:
+            save_tokens(uid, serialize_tokens(client))  # persist any refreshed tokens
+        except Exception:
+            pass
+        # Every section failed → surface a real error instead of a 200 the
+        # client would cache forever (an all-null 200 WITHOUT warnings is a
+        # legitimately empty activity and stays a 200).
+        has_data = bool(data.get("zones") or data.get("splits") or data.get("hrTrace") or data.get("trainingEffect"))
+        if not has_data and data.get("warnings"):
+            joined = " ".join(data["warnings"]).lower()
+            if "too many requests" in joined or "rate limit" in joined or "429" in joined:
+                return jsonify({"error": "garmin_rate_limited",
+                                "message": "Garmin is rate-limiting requests — try again in a few minutes."}), 429
+            if any(w in joined for w in ("401", "403", "expired", "unauthor", "forbidden")):
+                return jsonify({"error": "garmin_reauth",
+                                "message": "The Garmin connection has expired — reconnect it in your Profile."}), 401
+            return jsonify({"error": "Garmin detail failed: " + str(data["warnings"][0])[:200]}), 502
+        return jsonify(data)
+    except Exception as e:
+        msg = str(e).lower()
+        if "too many requests" in msg or "429" in msg:
+            return jsonify({"error": "garmin_rate_limited",
+                            "message": "Garmin is rate-limiting requests — try again in a few minutes."}), 429
+        return jsonify({"error": "Garmin detail failed: " + str(e)}), 502
 
 
 @app.route("/api/garmin/disconnect", methods=["POST"])
