@@ -49,23 +49,28 @@ from flask import Flask, request, jsonify
 from garminconnect import Garmin
 
 # ── Config ────────────────────────────────────────────────────────────────────
-SERVICE_VERSION = "2026-07-15a"  # shown at /healthz — bump when app.py changes
+SERVICE_VERSION = "2026-07-15b"  # shown at /healthz — bump when app.py changes
 
 
 def _lib_versions():
-    """Report the installed garminconnect + garth versions at /healthz. The
-    stored token format depends on these; if a redeploy silently pulls a new
-    version that can't read the saved tokens, connections drop and users must
-    re-login. Seeing the versions lets us pin requirements.txt to a known-good
-    pair."""
+    """Report installed library versions at /healthz. The stored token format
+    and Garmin's device fingerprint depend on these; if a redeploy silently
+    pulls newer ones, connections can drop and users must re-login. Seeing the
+    versions lets us pin requirements.txt to the known-good set. (garminconnect
+    0.3.x dropped garth and uses curl_cffi + ua-generator instead.)"""
     out = {}
     try:
         from importlib.metadata import version as _v
-        for pkg in ("garminconnect", "garth"):
+        for pkg in ("garminconnect", "garth", "curl_cffi", "ua-generator", "requests"):
             try:
                 out[pkg] = _v(pkg)
             except Exception:
-                out[pkg] = "unknown"
+                out[pkg] = "absent"
+    except Exception:
+        pass
+    try:
+        import sys
+        out["python"] = "%d.%d.%d" % sys.version_info[:3]
     except Exception:
         pass
     return out

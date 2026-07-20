@@ -1,3 +1,8 @@
 flask>=3.0,<4
-garminconnect>=0.2.19
+# Pinned exactly: 0.3.x rewrote Garmin auth (dropped garth, uses curl_cffi +
+# ua-generator) and defines the stored token format. Floating this (>=) let a
+# service redeploy silently pull a version that couldn't read saved tokens,
+# forcing users to re-login. 0.3.6 is the confirmed-working version (see
+# /healthz "libs"). Bump deliberately + re-test the Garmin login after.
+garminconnect==0.3.6
 PyJWT[crypto]>=2.8
