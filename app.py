@@ -49,7 +49,26 @@ from flask import Flask, request, jsonify
 from garminconnect import Garmin
 
 # ── Config ────────────────────────────────────────────────────────────────────
-SERVICE_VERSION = "2026-07-13c"  # shown at /healthz — bump when app.py changes
+SERVICE_VERSION = "2026-07-15a"  # shown at /healthz — bump when app.py changes
+
+
+def _lib_versions():
+    """Report the installed garminconnect + garth versions at /healthz. The
+    stored token format depends on these; if a redeploy silently pulls a new
+    version that can't read the saved tokens, connections drop and users must
+    re-login. Seeing the versions lets us pin requirements.txt to a known-good
+    pair."""
+    out = {}
+    try:
+        from importlib.metadata import version as _v
+        for pkg in ("garminconnect", "garth"):
+            try:
+                out[pkg] = _v(pkg)
+            except Exception:
+                out[pkg] = "unknown"
+    except Exception:
+        pass
+    return out
 SUPABASE_URL = (os.environ.get("SUPABASE_URL") or "").rstrip("/")
 SERVICE_ROLE = os.environ.get("SUPABASE_SERVICE_ROLE_KEY") or ""
 GARMIN_ENC_KEY = os.environ.get("GARMIN_ENC_KEY") or ""
@@ -506,7 +525,8 @@ def cors(resp):
 @app.route("/healthz", methods=["GET"])
 @app.route("/", methods=["GET"])
 def healthz():
-    return jsonify({"ok": True, "service": "fitmind-garmin", "version": SERVICE_VERSION, "configured": configured()})
+    return jsonify({"ok": True, "service": "fitmind-garmin", "version": SERVICE_VERSION,
+                    "configured": configured(), "libs": _lib_versions()})
 
 
 def _body():
