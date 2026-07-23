@@ -49,7 +49,7 @@ from flask import Flask, request, jsonify
 from garminconnect import Garmin
 
 # ── Config ────────────────────────────────────────────────────────────────────
-SERVICE_VERSION = "2026-07-15b"  # shown at /healthz — bump when app.py changes
+SERVICE_VERSION = "2026-07-15c"  # shown at /healthz — bump when app.py changes
 
 
 def _lib_versions():
@@ -164,6 +164,18 @@ def save_tokens(user_id, token_str):
 
 def delete_tokens(user_id):
     sb("DELETE", "garmin_tokens?user_id=eq.%s" % user_id)
+
+
+def _persist_client(user_id, client):
+    """Serialize + save the client's CURRENT tokens, swallowing errors. Called
+    right after login (which may rotate the refresh token) and again after a
+    pull, so the freshest refresh token is always stored — the single biggest
+    cause of 'connection lost after a while' is a rotated refresh token that
+    never got saved."""
+    try:
+        save_tokens(user_id, serialize_tokens(client))
+    except Exception as e:
+        print("[garmin] token persist failed for %s: %s" % (user_id, e), flush=True)
 
 
 # ── Garmin token (de)serialization ────────────────────────────────────────────
@@ -656,17 +668,25 @@ def sync():
     try:
         client = client_from_tokens(row["tokens"])
     except Exception as e:
+        # Log the REAL reason (token age helps too) — the client only sees a
+        # friendly message, so Render logs are where we diagnose recurring drops.
+        print("[garmin] sync token-load failed for %s (token saved %s): %s: %s"
+              % (uid, row.get("updated_at"), type(e).__name__, e), flush=True)
+        print(traceback.format_exc(), flush=True)
         msg = str(e).lower()
         if any(w in msg for w in ("401", "403", "expired", "unauthor", "forbidden", "login")):
             return jsonify({"error": "garmin_reauth",
                             "message": "The Garmin connection has expired — reconnect it in your Profile."}), 401
         return jsonify({"error": "Garmin sync failed: " + str(e)}), 502
+    # Persist immediately after load: garminconnect 0.3.x proactively refreshes
+    # the access token during login() and may ROTATE the refresh token. If we
+    # only saved after pull_all and that call failed, the rotated token would be
+    # lost and the NEXT refresh would fail → forced re-login. Save now so the
+    # freshest refresh token is always stored, regardless of what pull does.
+    _persist_client(uid, client)
     try:
         data = pull_all(client)
-        try:
-            save_tokens(uid, serialize_tokens(client))  # persist any refreshed tokens
-        except Exception:
-            pass
+        _persist_client(uid, client)  # persist any further refresh during the pull
         return jsonify(data)
     except Exception as e:
         return jsonify({"error": "Garmin sync failed: " + str(e)}), 502
@@ -695,12 +715,10 @@ def activity_detail():
             return jsonify({"error": "garmin_reauth",
                             "message": "The Garmin connection has expired — reconnect it in your Profile."}), 401
         return jsonify({"error": "Garmin detail failed: " + str(e)}), 502
+    _persist_client(uid, client)  # persist refreshed/rotated token right after load
     try:
         data = pull_activity_detail(client, aid)
-        try:
-            save_tokens(uid, serialize_tokens(client))  # persist any refreshed tokens
-        except Exception:
-            pass
+        _persist_client(uid, client)
         # Every section failed → surface a real error instead of a 200 the
         # client would cache forever (an all-null 200 WITHOUT warnings is a
         # legitimately empty activity and stays a 200).
