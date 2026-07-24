@@ -1,0 +1,31 @@
+name: Keep Garmin service awake
+
+# Render's free tier sleeps after ~15 min of inactivity, which slows syncs,
+# can drop the mid-login one-time-code step, and recycles the logs we need to
+# diagnose disconnects. This pings /healthz on a schedule so it stays warm.
+#
+# IMPORTANT: GitHub only gives UNLIMITED free Actions minutes on PUBLIC repos.
+# If the garmin-service repo is PRIVATE, this will burn through the ~2000 free
+# minutes/month — use UptimeRobot instead (a dedicated uptime pinger is also
+# more reliable than GitHub's scheduler, which delays/skips cron runs).
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'   # every 10 min (GitHub may fire late/batch these)
+  workflow_dispatch: {}        # lets you run it manually from the Actions tab
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping /healthz (retry through a cold start)
+        run: |
+          URL="https://garmin-service-trbs.onrender.com/healthz"
+          for i in 1 2 3 4; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 90 "$URL" || echo "000")
+            echo "attempt $i -> HTTP $code"
+            if [ "$code" = "200" ]; then echo "service is awake"; exit 0; fi
+            sleep 20
+          done
+          echo "warning: /healthz never returned 200 (service may be down)"
+          exit 0   # don't fail the workflow on a transient miss
